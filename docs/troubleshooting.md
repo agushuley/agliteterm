@@ -6,7 +6,13 @@ agliteterm keeps a small always-on log of its own decisions — session saves an
 counts, byte totals, and the exact error when a write fails), focus handoffs, and font and pack
 resolution — at `%LOCALAPPDATA%\agliteterm\agliteterm.log` (`agliteterm-<instance>.log` for named
 instances), rotating at about 1 MB into `.log.old`. It records what the client *did*, never terminal
-output, pasted text, or your command lines, so it is safe to attach to an issue.
+output, pasted text, or your command lines, so it is safe to attach to an issue. A `save ok` line
+means the state file changed: a tree change whose bytes are already on disk writes nothing and logs
+nothing. A save blocked inside the filesystem (a rename held by an endpoint-security filter) also
+logs nothing until it returns, so a quiet log is either a stable window or a stuck save. What tells
+the two apart is `sessions.tsv.tmp` beside the state file: a stuck save has already written it and
+is waiting to publish it, so a `.tmp` newer than `sessions.tsv` while the window is idle is a
+publish that has not returned. A stable window leaves no `.tmp` behind.
 
 ## Reporting a problem
 

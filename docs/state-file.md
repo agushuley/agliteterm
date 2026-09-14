@@ -103,9 +103,18 @@ honored. Captured replay defaults off; explicit pins and bindings do not depend 
 - **`.tmp`, then rename, one `.bak`.** The save writes `sessions.tsv.tmp`, rotates the current file
   to `sessions.tsv.bak` and renames the temp over the target. A zero-session save over a populated
   file is refused (the log says so); the one legitimate empty is the user closing the last session.
-  Any thread may save — the UI thread on every tree change and at quit, the control-pipe thread
-  after `restore capture` so the verb's reply describes a file that already exists — serialised by
-  one lock around the write and the rename.
+  Any thread may save — a dedicated saver thread that every tree change wakes (it lets a burst
+  settle for 200 ms and saves once), the UI thread at quit, the control-pipe thread after `restore
+  capture` so the verb's reply describes a file that already exists — serialised by one lock around
+  the write and the rename. A tree change never writes the file on the UI thread: one rename held
+  by an endpoint-security filter used to hang the window, keystrokes included, for as long as the
+  filter took. The verbs whose reply claims durability (`session resize`, `session restore` /
+  `bind`, `restore capture`, `workspace move`, `restore clear`, claude adopt / restart) still save
+  synchronously, some on the UI thread, so one of those calls can still wait on the filter — a
+  click or a keystroke cannot. A save whose bytes equal the last published ones is skipped while
+  that file is still on disk (the skip advances the stamp fence exactly as a write would), so the
+  log's `save ok` lines record changes, not repaints; a missing primary is written again from the
+  same bytes.
 - **Restore order**: `sessions.tsv`, then `.bak` when the primary is missing, empty or parses to no
   sessions, then a fresh window.
 

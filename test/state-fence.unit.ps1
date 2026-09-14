@@ -8,6 +8,20 @@ $runtime=Get-Content (Join-Path $repo 'src/remainder_runtime.h') -Raw
 $save=[regex]::Match($main,'(?ms)^    struct LockSave \{.*?^\}')
 $clear=[regex]::Match($runtime,'(?ms)^static std::string clearRestoreState\(\).*?^\}')
 if(-not $save.Success -or -not $clear.Success){throw 'Production save/clear bodies missing'}
+# The hang class this file guards: a tree change must never save on the UI thread again. refreshTree
+# wakes the worker; the worker exists; the skip in the save body moves the fence (checked below).
+$refresh=[regex]::Match($main,'(?ms)^static void refreshTree\(.*?^\}')
+if(-not $refresh.Success){throw 'Actual refreshTree missing'}
+if($refresh.Value -match 'saveSessionState\('){throw 'refreshTree saves inline on the UI thread again; it must call requestSessionSave'}
+if($refresh.Value -notmatch 'requestSessionSave\('){throw 'refreshTree no longer requests the worker save'}
+if($main -notmatch '(?m)^static DWORD WINAPI saveWorkerThread\('){throw 'save worker thread missing'}
+# OnDestroy joins the worker BEFORE its final save: a worker past its stop check that built after
+# killSession would publish fallback cwds over the live ones. The handle must be kept for the join.
+if($main -notmatch 'g_saveWorker = CreateThread\(nullptr, 0, saveWorkerThread'){throw 'the save worker handle is no longer kept for OnDestroy to join'}
+$destroy=[regex]::Match($main,'(?ms)^    void OnDestroy\(\) \{.*?^    \}')
+if(-not $destroy.Success){throw 'Actual OnDestroy missing'}
+$join=$destroy.Value.IndexOf('WaitForSingleObject(g_saveWorker');$final=$destroy.Value.IndexOf('saveSessionState();')
+if($join -lt 0 -or $final -lt 0 -or $join -gt $final){throw 'OnDestroy must join the save worker before its final saveSessionState'}
 $prefix=@'
 #include <string>
 #include <map>
@@ -22,8 +36,10 @@ constexpr int REPLACEFILE_IGNORE_MERGE_ERRORS=1,REPLACEFILE_WRITE_THROUGH=2,MOVE
 struct BY_HANDLE_FILE_INFORMATION {DWORD dwFileAttributes=0;};
 int g_lock=0,g_saveLock=1,heldState=0,heldSave=0,lockErrors=0,ioCalls=0,nextHandle=1;
 unsigned long long g_saveStamp=0,g_savePublished=0;
-DWORD error=0; bool flushOk=true,regular=true,markerOk=true;
-std::wstring failDelete;
+std::string g_savePublishedBytes;
+constexpr DWORD INVALID_FILE_ATTRIBUTES=0xFFFFFFFFul;
+DWORD error=0; bool flushOk=true,regular=true,markerOk=true,writeOk=true;
+std::wstring failDelete,failCreate;
 std::map<std::wstring,std::string> files; std::map<int,std::wstring> handles;
 std::function<void()> beforeSaveLock;
 void EnterCriticalSection(int* p){
@@ -40,14 +56,15 @@ std::string ctlOkStr(const std::string&s){return "ok:"+s;}
 template<class... T> void logWarn(const char*,T...){} template<class... T> void logInfo(const char*,T...){}
 DWORD GetLastError(){return error;}
 HANDLE CreateFileW(const wchar_t* p,int,int,void*,int creation,int,void*){
- io();std::wstring path=p;if(path.ends_with(L".cleared")&&!markerOk){error=5;return -1;}
+ io();std::wstring path=p;if(path.ends_with(L".cleared")&&!markerOk){error=5;return -1;}if(path==failCreate){error=5;return -1;}
  if(creation==CREATE_ALWAYS||!files.count(path))files[path]="";
  int handle=nextHandle++;handles[handle]=path;return handle;
 }
 BOOL GetFileInformationByHandle(HANDLE,BY_HANDLE_FILE_INFORMATION*info){io();info->dwFileAttributes=regular?0:FILE_ATTRIBUTE_REPARSE_POINT;return 1;}
+DWORD GetFileAttributesW(const wchar_t*p){io();return files.count(p)?0:INVALID_FILE_ATTRIBUTES;}
 BOOL FlushFileBuffers(HANDLE){io();return flushOk;}
 BOOL CloseHandle(HANDLE h){io();handles.erase(h);return 1;}
-BOOL WriteFile(HANDLE h,const void*data,DWORD size,DWORD*written,void*){io();files[handles.at(h)]={static_cast<const char*>(data),size};*written=size;return 1;}
+BOOL WriteFile(HANDLE h,const void*data,DWORD size,DWORD*written,void*){io();if(!writeOk){error=5;*written=0;return 0;}files[handles.at(h)]={static_cast<const char*>(data),size};*written=size;return 1;}
 BOOL DeleteFileW(const wchar_t*p){io();if(failDelete==p){error=5;return 0;}if(files.erase(p))return 1;error=ERROR_FILE_NOT_FOUND;return 0;}
 BOOL CopyFileW(const wchar_t*from,const wchar_t*to,BOOL){io();if(!files.count(from)){error=2;return 0;}files[to]=files[from];return 1;}
 BOOL MoveFileExW(const wchar_t*from,const wchar_t*to,int){io();if(!files.count(from)){error=2;return 0;}files[to]=files[from];files.erase(from);return 1;}
@@ -60,7 +77,7 @@ $tests=@'
 int main(){
  int checks=0,failed=0;auto check=[&](bool ok){++checks;if(!ok){++failed;std::printf("FAIL fence %d\n",checks);}};
  const auto path=stateFilePath();
- auto reset=[&]{g_saveStamp=g_savePublished=0;files={{path,"primary"},{path+L".bak","backup"},{path+L".tmp","temp"}};handles.clear();heldState=heldSave=lockErrors=ioCalls=0;beforeSaveLock=nullptr;flushOk=regular=markerOk=true;failDelete.clear();};
+ auto reset=[&]{g_saveStamp=g_savePublished=0;g_savePublishedBytes.clear();files={{path,"primary"},{path+L".bak","backup"},{path+L".tmp","temp"}};handles.clear();heldState=heldSave=lockErrors=ioCalls=0;beforeSaveLock=nullptr;flushOk=regular=markerOk=writeOk=true;failDelete.clear();failCreate.clear();};
  auto snapshot=[&]{LockG hold;return ++g_saveStamp;};
  // Older snapshot is paused before the actual save lock; clear publishes its durable fence first.
  reset();auto old=snapshot();auto cleared=clearRestoreState();int clearedIo=ioCalls;
@@ -89,6 +106,27 @@ int main(){
  check(publish(path,"kept-after-empty",snapshot()));check(files[path]=="kept-after-empty");
  check(!publish(path,"",snapshot(),0,false));check(files[path]=="kept-after-empty");
  check(publish(path,"",snapshot(),0,true));check(files[path].empty()&&!files.count(path+L".bak"));
+ check(lockErrors==0&&heldState==0&&heldSave==0);
+ // Bytes already on disk are not written again: the repeat costs one existence probe and no write,
+ // and rotates nothing. A missing primary is re-created from the same bytes; different bytes rotate.
+ reset();check(publish(path,"same",snapshot()));int afterFirst=ioCalls;check(files[path]=="same"&&files[path+L".bak"]=="primary");
+ check(publish(path,"same",snapshot()));check(ioCalls==afterFirst+1);check(files[path]=="same"&&files[path+L".bak"]=="primary");
+ files.erase(path);check(publish(path,"same",snapshot()));check(files[path]=="same"&&ioCalls>afterFirst+2);
+ check(publish(path,"changed",snapshot()));check(files[path]=="changed"&&files[path+L".bak"]=="same");
+ // The skip advances the fence: an older buffer still waiting for the save lock is dropped by a
+ // skipped newer snapshot exactly as by a written one, and cannot put stale bytes over the file.
+ reset();check(publish(path,"X",snapshot()));auto olderY=snapshot();auto newerX=snapshot();
+ check(publish(path,"X",newerX));check(g_savePublished==newerX);int skipped=ioCalls;
+ check(publish(path,"Y",olderY));check(files[path]=="X"&&ioCalls==skipped);
+ // A failed in-place write truncated the primary, so the bytes it used to hold are not "on disk":
+ // the next save with those bytes writes them again instead of skipping over the truncated file.
+ reset();check(publish(path,"A",snapshot()));failCreate=path+L".tmp";writeOk=false;
+ check(!publish(path,"B",snapshot()));check(files[path].empty());failCreate.clear();writeOk=true;
+ check(publish(path,"A",snapshot()));check(files[path]=="A");
+ // restore.clear forgets the bytes even when the primary survives its delete: the same snapshot
+ // afterwards is a real write, not a skip over a file the clear meant to remove.
+ reset();check(publish(path,"same",snapshot()));failDelete=path;check(clearRestoreState().find("partial failure")!=std::string::npos);
+ check(files[path]=="same");int surviving=ioCalls;check(publish(path,"same",snapshot()));check(ioCalls>surviving+1&&files[path]=="same");
  check(lockErrors==0&&heldState==0&&heldSave==0);
  std::printf("state fence: %d checks, %d failed\n",checks,failed);return failed?1:0;
 }
