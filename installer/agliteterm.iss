@@ -3,7 +3,10 @@
 ; Built via installer\build.ps1 (stages to stage\ then runs ISCC on this file).
 
 #define AppName    "agliteterm"
-#define AppVersion "0.19.5"
+; Fork/local releases: <upstream-version>-ah.<n> (artifact names + ping/updater). Reset n to 1 on each new upstream base.
+#define AppVersion "0.19.5-ah.1"
+; PE file version: four numeric fields; the fourth is the ah build index (here 1).
+#define VersionInfoVersion "0.19.5.1"
 #define AppExe     "agliteterm.exe"
 #define AppPublisher "Boris Kudriashov"
 
@@ -12,7 +15,8 @@ AppId={{E0ACBA4E-AAD3-4689-9234-66D3CD207A6A}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#VersionInfoVersion}
+VersionInfoTextVersion={#AppVersion}
 DefaultDirName={localappdata}\Programs\agliteterm
 DisableProgramGroupPage=yes
 DisableDirPage=auto
