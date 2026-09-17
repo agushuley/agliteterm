@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <map>
@@ -15,7 +16,8 @@ inline bool mode(const std::string& s) { return s == "send" || s == "new" || s =
 inline uint16_t chord(const std::string& text) {
     int mods = 0, key = 0; std::istringstream in(lower(trim(text))); std::string part;
     const std::map<std::string,int> names = {{"tab",9},{"enter",13},{"escape",27},{"esc",27},{"space",32},
-        {"left",37},{"up",38},{"right",39},{"down",40},{"semicolon",186},{"equals",187},{"comma",188},
+        {"left",37},{"up",38},{"right",39},{"down",40},{"insert",45},{"delete",46},{"ins",45},{"del",46},
+        {"semicolon",186},{"equals",187},{"comma",188},
         {"minus",189},{"period",190},{"slash",191},{"backtick",192},{"lbracket",219},{"backslash",220},
         {"rbracket",221},{"quote",222}};
     while (std::getline(in, part, '+')) {
@@ -25,6 +27,9 @@ inline uint16_t chord(const std::string& text) {
         else if (part == "shift") mods |= 1;
         else {
             if (key || part.empty()) return 0;
+            if (part == "esc") part = "escape";
+            else if (part == "ins") part = "insert";
+            else if (part == "del") part = "delete";
             if (part.size() == 1 && ((part[0] >= 'a' && part[0] <= 'z') || (part[0] >= '0' && part[0] <= '9')))
                 key = part[0] >= 'a' ? part[0] - 'a' + 'A' : part[0];
             else if (names.count(part)) key = names.at(part);
@@ -40,7 +45,12 @@ struct Binding { uint16_t key; std::string spelling, action; bool leader; int li
 struct Catalog {
     std::vector<Command> commands;
     std::vector<Binding> bindings;
+    std::vector<uint16_t> unmapped;
     uint16_t leader = 0;
+    bool isUnmapped(uint16_t key) const {
+        for (uint16_t u : unmapped) if (u == key) return true;
+        return false;
+    }
     const Command* find(const std::string& label) const {
         for (const auto& c : commands) if (lower(c.label) == lower(label)) return &c;
         return nullptr;
@@ -59,6 +69,26 @@ inline bool parse(const std::string& input, const std::map<std::string,int>& act
         ++number; line = trim(line);
         if (number == 1 && line.compare(0, 3, "\xef\xbb\xbf") == 0) line = trim(line.substr(3));
         if (line.empty() || line[0] == '#') continue;
+        const auto tagOnly = lower(line);
+        if (tagOnly.rfind("unmap ", 0) == 0) {
+            auto head = trim(line.substr(6));
+            bool second = lower(head).rfind("leader ", 0) == 0;
+            if (second) head = trim(head.substr(7));
+            size_t start = 0;
+            for (;;) {
+                const auto end = head.find('|', start);
+                const auto spelling = trim(head.substr(start, end == std::string::npos ? end : end - start));
+                const auto key = chord(spelling);
+                if (!key) return bad("bad unmap chord");
+                result.unmapped.push_back(key);
+                result.bindings.erase(std::remove_if(result.bindings.begin(), result.bindings.end(),
+                    [&](const Binding& b) { return b.key == key && b.leader == second; }),
+                    result.bindings.end());
+                if (end == std::string::npos) break;
+                start = end + 1;
+            }
+            continue;
+        }
         auto eq = line.find('='); if (eq == std::string::npos) return bad("expected '='");
         auto head = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1)), tag = lower(head);
         if (tag == "leader") { result.leader = chord(value); if (!result.leader) return bad("bad leader chord"); }
