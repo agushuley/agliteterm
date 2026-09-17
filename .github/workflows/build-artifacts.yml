@@ -1,0 +1,38 @@
+# Fast manual build: MSVC + pinned agwinterm core, upload bin\ for download.
+# Full test gate remains in ci.yml (~40 min). Use this when you need a Windows build without local VS.
+name: Build artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (branch, tag, or SHA)
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Fetch the pinned agwinterm core
+        shell: pwsh
+        run: ./tools/fetch-native.ps1
+
+      - name: Build agliteterm
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Upload bin
+        uses: actions/upload-artifact@v4
+        with:
+          name: agliteterm-bin-${{ github.run_number }}
+          path: bin/
+          retention-days: 30
