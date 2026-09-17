@@ -19,7 +19,15 @@ command [detached] Editor = code "{AGW_CWD}"
 leader = ctrl+k
 map leader b = command:Build
 map ctrl+shift+b = command:Build
+unmap ctrl+d
+map ctrl+insert = copy_selection
+map shift+insert = paste
 ```
+
+`unmap` drops a `map` binding (or blocks a registry chord) so the key reaches the shell. Chords
+also accept `insert`/`delete` (`ins`/`del` aliases). When Next/Previous Session is bound to
+Ctrl+Tab, lite walks the MRU stack while Ctrl is held (release Ctrl to commit); `unmap ctrl+tab`
+restores plain Tab to the terminal.
 
 `command run "Build"` matches a complete label, ASCII-case-insensitively. Unmatched raw text
 defaults to a new PowerShell session; `--mode send|new|overlay|detached` overrides either default.

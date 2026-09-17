@@ -3269,6 +3269,77 @@ static void toggleSplit() {
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+static bool sessionCycleCombo(WORD combo, bool* back) {
+    if (g_commands.isUnmapped(combo)) return false;
+    if (const auto* b = g_commands.binding(combo, false)) {
+        if (b->action == "next_session") { if (back) *back = false; return true; }
+        if (b->action == "previous_session") { if (back) *back = true; return true; }
+        return false;
+    }
+    if (g_keys[KB_PREV] == combo) { if (back) *back = true; return true; }
+    if (g_keys[KB_NEXT] == combo) { if (back) *back = false; return true; }
+    return false;
+}
+static void mruTabCancel() {
+    std::string startId;
+    { LockG hold;
+        if (g_walk.active) startId = g_walk.startId;
+        g_walk = {};
+    }
+    if (!startId.empty()) {
+        LockG hold;
+        for (int i = 0; i < (int)g_sessions.size(); i++)
+            if (g_sessions[i]->id == startId && !g_sessions[i]->hidden) { selectPrimary(i); return; }
+    }
+}
+static void mruTabCommit() {
+    { LockG hold; g_walk = {}; touchMruLocked(displayedOwner()); }
+    PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+static void mruTabStep(bool back) {
+    std::string pick;
+    {
+        LockG hold;
+        auto liveIndex = [&](const std::string& id) {
+            for (int i = 0; i < (int)g_sessions.size(); i++)
+                if (g_sessions[i]->id == id && !g_sessions[i]->hidden && !g_sessions[i]->exited) return i;
+            return -1;
+        };
+        g_mru.erase(std::remove_if(g_mru.begin(), g_mru.end(), [&](const std::string& id) { return liveIndex(id) < 0; }), g_mru.end());
+        for (Session* s : g_sessions)
+            if (!s->hidden && !s->exited && std::find(g_mru.begin(), g_mru.end(), s->id) == g_mru.end()) g_mru.push_back(s->id);
+        if (!g_walk.active) {
+            touchMruLocked(displayedOwner());
+            g_walk = {};
+            g_walk.order = g_mru;
+            g_walk.active = g_walk.order.size() >= 2;
+            if (Session* s = displayedOwner()) g_walk.startId = s->id;
+            auto start = std::find(g_walk.order.begin(), g_walk.order.end(), g_walk.startId);
+            g_walk.cursor = start == g_walk.order.end() ? -1 : (int)(start - g_walk.order.begin());
+        }
+        if (!g_walk.active) return;
+        const int n = (int)g_walk.order.size();
+        for (int tries = 0; tries < n; ++tries) {
+            g_walk.cursor = g_walk.cursor < 0 ? (back ? n - 1 : 0) : (g_walk.cursor + (back ? -1 : 1) + n) % n;
+            if (liveIndex(g_walk.order[g_walk.cursor]) >= 0) { pick = g_walk.order[g_walk.cursor]; break; }
+        }
+        const int idx = liveIndex(pick);
+        if (idx >= 0) {
+            g_pane[0] = idx;
+            setFocusedPane(0);
+            g_activeWs = g_sessions[idx]->ws;
+            g_sessions[idx]->notifications = 0;
+        }
+    }
+    if (!pick.empty()) {
+        syncSplitToPrimary();
+        PostMessageW(g_hwnd, WM_APP_REFRESHTREE, 0, 0);
+        PostMessageW(g_hwnd, WM_APP_UPDATESTATUS, 0, 0);
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
+}
+
 // Cycle the MAIN pane through visible sessions (skips hidden split shells). dir = +1 next, -1 prev.
 static void cycleSession(int dir) {
     int n = (int)g_sessions.size();
@@ -5969,6 +6040,7 @@ static void runKbAction(int a) {
 static bool handleKeyDown(WPARAM vk, bool repeat = false) {
     if (g_dashboard) return dashboardKey(vk);
     endMarkModeIfMoved();
+    if (g_walk.active && vk == VK_ESCAPE) { mruTabCancel(); return true; }
     if (g_palette) {   // palette captures navigation while open; plain chars flow to WM_CHAR -> query
         int n = (int)g_palHits.size();
         auto move = [&](int d) {
@@ -5996,6 +6068,12 @@ static bool handleKeyDown(WPARAM vk, bool repeat = false) {
         return false;   // anything else: let WM_CHAR through for the query (OnChar routes it)
     }
     if (markModeKey(vk)) return true;
+    if (ctrlDown() && !altDown() && vk == VK_TAB) {
+        BYTE mods = (BYTE)(HOTKEYF_CONTROL | (shiftDown() ? HOTKEYF_SHIFT : 0));
+        WORD combo = MAKEWORD((BYTE)vk, mods);
+        bool back = false;
+        if (sessionCycleCombo(combo, &back)) { mruTabStep(back); return true; }
+    }
     // Configurable key bindings; unmatched combos otherwise reach the shell.
     // Match the pressed vk + modifiers against the user's bindings; the same actions are always on the
     // menu + toolbar. Checked before the xterm-key encoding so a bound combo wins over the default key.
@@ -6003,9 +6081,12 @@ static bool handleKeyDown(WPARAM vk, bool repeat = false) {
         BYTE mods = (BYTE)((shiftDown() ? HOTKEYF_SHIFT : 0) | (ctrlDown() ? HOTKEYF_CONTROL : 0) | (altDown() ? HOTKEYF_ALT : 0));
         WORD combo = MAKEWORD((BYTE)vk, mods);
         if (customKey(combo)) return true;
-        if (mods) for (int a = 0; a < KB_COUNT; a++) if (g_keys[a] == combo) {
-            if (a != KB_QUICK || !repeat) runKbAction(a);
-            return true;
+        if (mods && !g_commands.isUnmapped(combo)) {
+            for (int a = 0; a < KB_COUNT; a++) {
+                if (g_keys[a] != combo) continue;
+                if (a != KB_QUICK || !repeat) runKbAction(a);
+                return true;
+            }
         }
     }
 
@@ -8070,8 +8151,10 @@ public:
         MSG_WM_KILLFOCUS(OnKillFocusFrame)
         MSG_WM_DESTROY(OnDestroy)
         MESSAGE_HANDLER(WM_KEYDOWN, OnKey)
+        MESSAGE_HANDLER(WM_KEYUP, OnKeyUp)
         MESSAGE_HANDLER(WM_CAPTURECHANGED, OnCaptureChanged)
         MESSAGE_HANDLER(WM_SYSKEYDOWN, OnKey)
+        MESSAGE_HANDLER(WM_SYSKEYUP, OnKeyUp)
         MESSAGE_HANDLER(WM_SETCURSOR, OnSetCursor)
         MESSAGE_HANDLER(WM_APP_REFRESHTREE, OnRefreshTree)
         MESSAGE_HANDLER(WM_APP_UPDATESTATUS, OnUpdateStatus)
@@ -8169,6 +8252,11 @@ public:
         g_swallowChar = handleKeyDown(wp, (lp & (1LL << 30)) != 0);
         if (g_swallowChar) return 0;
         bHandled = FALSE;   // unhandled: let DefWindowProc do its thing (menu keys etc.)
+        return 0;
+    }
+    LRESULT OnKeyUp(UINT, WPARAM wp, LPARAM, BOOL& bHandled) {
+        if (wp == VK_CONTROL && g_walk.active) { mruTabCommit(); return 0; }
+        bHandled = FALSE;
         return 0;
     }
 

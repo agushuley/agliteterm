@@ -3,7 +3,9 @@
 static int checks = 0, failures = 0;
 static void check(bool value, const char* name) { ++checks; if (!value) { ++failures; std::printf("FAIL %s\n",name); } }
 int main() {
-    for (const auto& key : {"a","0","f1","f12","tab","enter","escape","space","left","right","up","down",
+    check(commands::chord("ctrl+insert")==commands::chord("ctrl+ins"),"insert alias");
+    check(commands::chord("shift+delete")==commands::chord("shift+del"),"delete alias");
+    for (const auto& key : {"a","0","f1","f12","tab","enter","escape","space","left","right","up","down","insert","delete",
          "comma","period","slash","semicolon","quote","backtick","minus","equals","lbracket","rbracket","backslash"}) {
         check(commands::chord(key) != 0,"plain chord");
         check(commands::chord("ctrl+alt+shift+"+std::string(key)) == (commands::chord(key)|0x700),"all modifiers");
@@ -29,6 +31,9 @@ int main() {
     check(!parse(std::string("command X=a\0b",13)),"NUL refuses");
     check(parse("\xef\xbb\xbf# bom\r\ncommand X = hi\r\nmap x=command:X\r\nmap x=select_all"),"BOM CRLF and replacement binding");
     check(catalog.binding(commands::chord("x"),false)->action=="select_all","last binding wins");
+    check(parse("unmap ctrl+d\nmap ctrl+alt+d = select_all") && !catalog.binding(commands::chord("ctrl+d"),false)
+        && catalog.binding(commands::chord("ctrl+alt+d"),false)->action=="select_all","unmap drops binding");
+    check(catalog.isUnmapped(commands::chord("ctrl+d")),"unmap records chord");
     check(parse("command X=echo a|b\nmap f5 | f7 = command:X\nleader=f10\nmap leader a | b=select_all"),"ordinary and leader alternatives");
     check(catalog.bindings.size()==4 && catalog.commands[0].text=="echo a|b","only chord heads split on pipes");
     for(auto bad:{"map f5 | = select_all","map | f5=select_all","map f5 || f7=select_all","map f5 | unknown=select_all","leader=f5|f7"}) {
