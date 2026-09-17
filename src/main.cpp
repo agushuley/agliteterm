@@ -1085,6 +1085,8 @@ static const KbInfo kKbInfo[KB_COUNT] = {
 };
 static WORD g_keys[KB_COUNT] = { 0 };
 static commands::Catalog g_commands; // UI-thread owned; pipe access uses dispatchConfig
+static std::string g_confirmCloseMode = "false";   // false | interactive | true (agwinterm confirm-close-session)
+static bool g_autoCloseSessionOnExit = false;
 static bool g_leaderPending = false;
 static ULONGLONG g_leaderAt = 0;
 static bool loadCommands(std::string& error);
@@ -2992,7 +2994,36 @@ static Session* unlistOverlayLocked(Session* shell) {
     }
     return ov;
 }
-static void closeSessionAt(int idx) {
+static bool sessionHasLiveShell(Session* s) {
+    if (!s) return false;
+    LockG hold;
+    if (!s->exited) return true;
+    if (!s->splitId.empty()) {
+        const int si = indexOfSessionId(s->splitId);
+        if (si >= 0 && !g_sessions[si]->exited) return true;
+    }
+    return false;
+}
+static bool shouldConfirmCloseSession(bool live) {
+    return live && (g_confirmCloseMode == "interactive" || g_confirmCloseMode == "true");
+}
+static bool confirmCloseOk(Session* ses) {
+    if (!shouldConfirmCloseSession(sessionHasLiveShell(ses))) return true;
+    int priorIdx = -1, sesIdx = -1;
+    { LockG hold;
+        Session* prior = displayedOwner();
+        priorIdx = prior ? indexOfSession(prior) : -1;
+        sesIdx = indexOfSession(ses);
+    }
+    if (sesIdx < 0) return true;
+    if (priorIdx != sesIdx) selectPrimary(sesIdx);
+    const bool ok = MessageBoxW(g_hwnd,
+        L"Close this session and end what's running in it?", L"Close session",
+        MB_YESNO | MB_ICONQUESTION) == IDYES;
+    if (priorIdx >= 0 && priorIdx != sesIdx) selectPrimary(priorIdx);
+    return ok;
+}
+static void closeSessionAt(int idx, bool captureForReopen = true) {
     if (idx < 0 || idx >= (int)g_sessions.size()) return;
     Session* cs = g_sessions[idx];
     // A split shell exists only to be one session's second pane, so it dies with that session -
@@ -3021,7 +3052,7 @@ static void closeSessionAt(int idx) {
     EnterCriticalSection(&g_lock);
     idx = indexOfSession(cs); // host I/O above allowed another client to unlist/shift sessions
     if (idx < 0) { LeaveCriticalSection(&g_lock); return; }
-    if (!cs->hidden) {   // snapshot + append ordered atomically against workspace.move
+    if (captureForReopen && !cs->hidden) {   // snapshot + append ordered atomically against workspace.move
         if (g_closedStack.size() >= 16) g_closedStack.erase(g_closedStack.begin());
         g_closedStack.push_back({ cs->name, g_workspaces.token(cs->ws), cs->app, cs->cwd, cs->args, cs->context, cs->exactArgs });
     }
@@ -3118,7 +3149,10 @@ static void closeFocused() {
         Session* owner = displayedOwner();
         if (owner) { closeSplitSide(owner, g_focus == 0); return; }
     }
-    closeSessionAt(g_pane[0]);
+    if (g_pane[0] >= 0 && g_pane[0] < (int)g_sessions.size()) {
+        Session* ses = g_sessions[g_pane[0]];
+        if (confirmCloseOk(ses)) closeSessionAt(g_pane[0]);
+    }
 }
 
 // Close ONE side of `owner`'s split — the primitive every unsplit goes through (P4): the menu / key
@@ -3453,6 +3487,14 @@ static void loadColors() {   // config API and startup share key names, types, v
     // later by loadWindowRect): the pair is checked against each other at the first WM_SIZE, once
     // the client width exists — fitSidebarToClient, from OnSize.
     sz = sizeof(v); if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"SidebarW", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && (int)v >= kSidebarMinW && (int)v <= kSidebarMaxW) g_sidebarW = g_sidebarWPref = v;
+    wchar_t closeMode[32]{}; DWORD closeModeSz = sizeof(closeMode);
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"ConfirmCloseSession", RRF_RT_REG_SZ, nullptr, closeMode, &closeModeSz) == ERROR_SUCCESS) {
+        const auto mode = configuration::normalized(narrow(closeMode));
+        if (mode == "false" || mode == "interactive" || mode == "true") g_confirmCloseMode = mode;
+    }
+    sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, L"AutoCloseSessionOnExit", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS)
+        g_autoCloseSessionOnExit = v != 0;
 }
 static void loadKeys(bool cleanupObsolete = true) {   // absent = seeded default or unbound (0)
     std::fill(std::begin(g_keys), std::end(g_keys), (WORD)0);
@@ -6323,7 +6365,7 @@ static void showTreeContextMenu() {
             if (isSession && si < (int)g_sessions.size()) toggleFlag(g_sessions[si]);
             break;
         case IDM_CLOSE:
-            if (isSession) closeSessionAt(si);
+            if (isSession && si < (int)g_sessions.size() && confirmCloseOk(g_sessions[si])) closeSessionAt(si);
             break;
         case IDM_DELWS:
             if (!isSession) deleteWorkspace(cws);
@@ -7850,6 +7892,8 @@ static std::string configOnUi(const JsonReq& req) {
             result += std::string(key.name) + " = " + configuration::format(key, configValue(key));
         }
         result += "\nomp-theme = " + ompTheme();
+        result += "\nconfirm-close-session = " + g_confirmCloseMode;
+        result += std::string("\nauto-close-session-on-exit = ") + (g_autoCloseSessionOnExit ? "true" : "false");
         return ctlOkStr(result);
     }
     const bool theme = cmd == "theme.set";
@@ -7857,6 +7901,8 @@ static std::string configOnUi(const JsonReq& req) {
     const auto* key = configuration::find(name);
     if (cmd == "config.get") {
         if (name == "omp-theme") return ctlOkStr(ompTheme());
+        if (name == "confirm-close-session") return ctlOkStr(g_confirmCloseMode);
+        if (name == "auto-close-session-on-exit") return ctlOkStr(g_autoCloseSessionOnExit ? "true" : "false");
         if (!key) return ctlErr("unknown config key '" + name + "'");
         LockG hold; return ctlOkStr(configuration::format(*key, configValue(*key)));
     }
@@ -7877,6 +7923,27 @@ static std::string configOnUi(const JsonReq& req) {
         const auto& path = req.get("args.resolved-theme");
         if (!saveOmpTheme(path)) return ctlErr("omp-theme could not be saved; configuration unchanged");
         return ctlOkStr("omp-theme = " + path + "  (applies to eligible new shells)");
+    }
+    if (cmd == "config.set" && name == "confirm-close-session") {
+        const auto mode = configuration::normalized(req.get("args.value"));
+        if (mode != "false" && mode != "interactive" && mode != "true")
+            return ctlErr("confirm-close-session must be false, interactive or true");
+        const auto wmode = widen(mode);
+        if (RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"ConfirmCloseSession", REG_SZ,
+                            wmode.c_str(), (DWORD)((wmode.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS)
+            return ctlErr("config could not be saved; configuration unchanged");
+        g_confirmCloseMode = mode;
+        return ctlOkStr("confirm-close-session = " + mode);
+    }
+    if (cmd == "config.set" && name == "auto-close-session-on-exit") {
+        uint32_t value = 0;
+        if (!configuration::parse(*configuration::find("copy-on-select"), req.get("args.value"), value))
+            return ctlErr("invalid value for config key 'auto-close-session-on-exit'");
+        DWORD stored = value;
+        if (RegSetKeyValueW(HKEY_CURRENT_USER, kRegKey, L"AutoCloseSessionOnExit", REG_DWORD, &stored, sizeof(stored)) != ERROR_SUCCESS)
+            return ctlErr("config could not be saved; configuration unchanged");
+        g_autoCloseSessionOnExit = value != 0;
+        return ctlOkStr(std::string("auto-close-session-on-exit = ") + (value ? "true" : "false"));
     }
     if (cmd == "settings.open") {
         if (!PostMessageW(g_hwnd, WM_COMMAND, IDM_PROPERTIES, 0)) return ctlErr("settings could not be queued");
@@ -8407,6 +8474,11 @@ public:
             else owner = splitOwnerOf(s);
         }
         if (owner) closeSplitSide(owner, closeOwner);
+        else if (g_autoCloseSessionOnExit && !s->hidden) {
+            int idx = -1;
+            { LockG hold; idx = indexOfSession(s); }
+            if (idx >= 0) closeSessionAt(idx, false);
+        }
         return 0;
     }
     LRESULT OnHostAction(UINT, WPARAM wp, LPARAM lp, BOOL&) {
@@ -10910,7 +10982,11 @@ static std::string ctlDispatch(const std::string& line) {
             return ctlOkStr("closed");
         }
         for (int i2 = 0; i2 < (int)g_sessions.size(); i2++)
-            if (g_sessions[i2] == target) { closeSessionAt(i2); break; }
+            if (g_sessions[i2] == target) {
+                if (!confirmCloseOk(target)) return ctlErr("close cancelled");
+                closeSessionAt(i2);
+                break;
+            }
         return ctlOkStr("closed");
     }
     if (cmd == "session.overlay") {   // run a command in an overlay popup over the main window
