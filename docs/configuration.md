@@ -26,6 +26,8 @@ an unknown outcome: read back before retrying.
 | scrollback-lines | 0..1000000; default 5000; new surfaces only, no live eviction; positive caps allow 512 rows of batched-trim slack |
 | omp-theme | a theme name (from `omp list`) or path for eligible new PowerShell shells, or `none` (see below) |
 | restore-commands | true/false, default false (see below) |
+| confirm-close-session | false (default), interactive, or true — confirm before closing a live session from the UI |
+| auto-close-session-on-exit | true/false, default false — remove a single-pane session when its shell exits (not added to Reopen Closed Session) |
 
 `config list` is the authoritative list; it also reports the cursor and quick-terminal keys this table
 leaves out.
