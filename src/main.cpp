@@ -1110,7 +1110,7 @@ enum { IDM_NEW = 1, IDM_CLOSE = 2, IDM_SPLIT = 3, IDM_NEXT = 4, IDM_COPY = 5, ID
        IDM_QUICK = 120, IDM_SCRATCH = 121, IDM_REOPEN = 122,
        IDM_TG_SIDEBAR = 123, IDM_TG_TOOLBAR = 124, IDM_TG_STATUS = 125,
        IDM_FLAG = 126, IDM_FLAGVIEW = 127, IDM_ATTENTION = 128, IDM_FOCUSWS = 129, IDM_PALETTE = 130,
-       IDM_UPDATE = 131, IDM_INSTALLSKILL = 132, IDM_READONLY = 135 };
+       IDM_UPDATE = 131, IDM_INSTALLSKILL = 132, IDM_HELP = 133, IDM_READONLY = 135 };
 #define IDM_MOVE_BASE 300   // "Move to workspace <w>" = IDM_MOVE_BASE + w
 enum { ID_TREE = 200, ID_TRAY = 201, ID_TOOLBAR = 202, ID_STATUS = 203 };
 
@@ -1344,6 +1344,13 @@ static std::vector<std::wstring> g_palCustom; // UI snapshot of configured comma
 static int g_paletteSel = 0;                   // selection: index into g_palHits
 static int g_palTop = 0;                       // first visible row of the viewport
 static RECT g_palBox{}, g_palList{};           // last painted geometry (mouse hit-testing)
+
+// F1 Help overlay (agwinterm parity): version in title + body, scrollable bindings list.
+static bool g_helpOpen = false;
+static int g_helpScroll = 0;                   // first visible line index
+static std::vector<std::wstring> g_helpLines;
+static RECT g_helpCard{};
+static int g_helpViewLines = 0;
 
 // Fuzzy match: every query char must appear in order; starts of words score higher, consecutive
 // runs higher still. Returns <0 for no match. Case-insensitive.
@@ -4898,6 +4905,8 @@ afterGridPaint:;
     }
 }
 
+static void paintHelp(HDC mem, RECT rc);   // F1 help card (defined after updVersion)
+
 static void paint(HDC dc, RECT rc) {
     HDC mem = CreateCompatibleDC(dc);
     HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
@@ -5030,6 +5039,8 @@ static void paint(HDC dc, RECT rc) {
             FillRect(mem, &tr, tb); DeleteObject(tb);
         }
     }
+
+    if (g_helpOpen) paintHelp(mem, rc);
 
     paintAttention(mem, rc);
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
@@ -5840,6 +5851,127 @@ static void updCheck(bool interactive) {
     else g_updBusy = false;
 }
 
+static bool helpIsSection(const std::wstring& line) {
+    if (line.empty() || line.find(L' ') != std::wstring::npos) return false;
+    for (wchar_t c : line) if (iswlower(c)) return false;
+    return line.size() < 60;
+}
+
+static std::vector<std::wstring> buildHelpLines() {
+    std::wstring ver = updVersion();
+    std::vector<std::wstring> lines{
+        L"GETTING STARTED",
+        L"Version: " + ver,
+        L"",
+        L"agliteterm is a lightweight native terminal: sessions live in the left sidebar,",
+        L"each with a status dot an agent can set via the control API.",
+        L"",
+        L"FOCUS & NAVIGATION",
+        L"F1            this help (including while full-screen terminal apps run)",
+        L"Alt or F10    menu bar: arrows move, Enter opens, Esc leaves",
+        L"Esc           close overlays (help, palette, search)",
+        L"",
+        L"KEY BINDINGS (effective — keymap.conf applied)",
+    };
+    struct Row { std::wstring key, label; };
+    std::vector<Row> rows;
+    for (int a = 0; a < KB_COUNT; a++)
+        if (g_keys[a]) rows.push_back({ palKeyName(g_keys[a]), kKbInfo[a].label });
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const Row& x, const Row& y) { return _wcsicmp(x.label.c_str(), y.label.c_str()) < 0; });
+    for (const auto& r : rows) {
+        std::wstring line = r.key;
+        if (line.size() < 20) line.append(20 - line.size(), L' ');
+        line += r.label;
+        lines.push_back(line);
+    }
+    lines.push_back(L"");
+    lines.push_back(L"MORE");
+    lines.push_back(L"File → Keyboard… edits bindings.  Control API: JSON on the named pipe");
+    lines.push_back(L"(see docs/agent-integration.md).");
+    return lines;
+}
+
+static void openHelp() {
+    g_palette = false;
+    g_helpLines = buildHelpLines();
+    g_helpOpen = true;
+    g_helpScroll = 0;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void closeHelp() {
+    g_helpOpen = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static bool helpKey(WPARAM vk) {
+    int n = (int)g_helpLines.size();
+    int view = max(1, g_helpViewLines);
+    int maxScroll = max(0, n - view);
+    auto scroll = [&](int d) {
+        g_helpScroll = max(0, min(maxScroll, g_helpScroll + d));
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    };
+    switch (vk) {
+        case VK_ESCAPE: case VK_F1: closeHelp(); return true;
+        case VK_DOWN:   scroll(+1); return true;
+        case VK_UP:     scroll(-1); return true;
+        case VK_NEXT:   scroll(+view); return true;
+        case VK_PRIOR:  scroll(-view); return true;
+        case VK_HOME:   g_helpScroll = 0; InvalidateRect(g_hwnd, nullptr, FALSE); return true;
+        case VK_END:    g_helpScroll = maxScroll; InvalidateRect(g_hwnd, nullptr, FALSE); return true;
+    }
+    return true;   // modal while open
+}
+
+static void paintHelp(HDC mem, RECT rc) {
+    int cw = rc.right, ch = rc.bottom;
+    HBRUSH dim = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(mem, &rc, dim);
+    DeleteObject(dim);
+
+    int rowH = g_ch + 4;
+    int cardW = min(640, cw - 60), cardH = min(680, ch - 80);
+    if (cardW < 280) cardW = max(280, cw - 24);
+    int cx = (cw - cardW) / 2, cy = max(toolbarTop() + 16, (ch - cardH) / 2);
+    g_helpCard = { cx, cy, cx + cardW, cy + cardH };
+
+    HBRUSH bb = CreateSolidBrush(g_th.bar);
+    FillRect(mem, &g_helpCard, bb); DeleteObject(bb);
+    HBRUSH fr = CreateSolidBrush(g_th.border);
+    FrameRect(mem, &g_helpCard, fr); DeleteObject(fr);
+
+    SelectObject(mem, g_fonts[0]);
+    SetBkMode(mem, TRANSPARENT);
+    std::wstring ver = updVersion();
+    std::wstring title = L"Help · agliteterm " + ver;
+    SetTextColor(mem, g_th.text);
+    RECT hdr{ cx + 20, cy + 12, cx + cardW - 220, cy + 36 };
+    DrawTextW(mem, title.c_str(), -1, &hdr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    SetTextColor(mem, g_th.dim);
+    RECT hint{ cx + cardW - 210, cy + 14, cx + cardW - 16, cy + 34 };
+    DrawTextW(mem, L"Esc to close · ↑↓ scroll", -1, &hint, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+
+    int top = cy + 44, bottom = cy + cardH - 14;
+    int viewH = bottom - top;
+    g_helpViewLines = max(1, viewH / rowH);
+    HRGN clip = CreateRectRgn(cx, top, cx + cardW, bottom);
+    SelectClipRgn(mem, clip);
+    int y = top;
+    for (int i = g_helpScroll; i < (int)g_helpLines.size(); i++) {
+        if (y + rowH > bottom) break;
+        const std::wstring& line = g_helpLines[i];
+        bool section = helpIsSection(line);
+        SetTextColor(mem, section ? g_th.accent : g_th.text);
+        RECT lr{ cx + 20, y, cx + cardW - 20, y + rowH };
+        DrawTextW(mem, line.c_str(), -1, &lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        y += rowH;
+    }
+    SelectClipRgn(mem, nullptr);
+    DeleteObject(clip);
+}
+
 static void togglePalette() {
     g_palette = !g_palette;
     g_palQuery.clear();
@@ -5927,6 +6059,8 @@ static void runKbAction(int a) {
 static bool handleKeyDown(WPARAM vk, bool repeat = false) {
     if (g_dashboard) return dashboardKey(vk);
     endMarkModeIfMoved();
+    if (g_helpOpen) return helpKey(vk);
+    if (vk == VK_F1 && !ctrlDown() && !altDown() && !shiftDown()) { openHelp(); return true; }
     if (g_palette) {   // palette captures navigation while open; plain chars flow to WM_CHAR -> query
         int n = (int)g_palHits.size();
         auto move = [&](int d) {
@@ -6383,6 +6517,7 @@ static HMENU buildMenuBar() {
     HMENU help = CreatePopupMenu();
     AppendMenuW(help, MF_STRING, IDM_INSTALLSKILL, L"Install Agent &Skill…");
     AppendMenuW(help, MF_STRING, IDM_UPDATE, L"Check for &Updates…");
+    AppendMenuW(help, MF_STRING, IDM_HELP, L"&Help…\tF1");
     AppendMenuW(help, MF_STRING, IDM_ABOUT, L"&About agliteterm");
     HMENU bar = CreateMenu();
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
@@ -8091,6 +8226,7 @@ public:
     // ---- keyboard ----
     void OnChar(TCHAR chr, UINT, UINT) {
         if (g_dashboard) return;
+        if (g_helpOpen) return;
         if (g_palette) { if (g_swallowChar) g_swallowChar = false; else palChar((wchar_t)chr); return; }
         if (g_swallowChar) { g_swallowChar = false; return; }   // belongs to a keydown a binding consumed
         if (chr == L'\r') { sendBytes("\r", 1); return; }
@@ -8108,6 +8244,14 @@ public:
     // ---- mouse ----
     BOOL OnMouseWheel(UINT nFlags, short zDelta, CPoint pt) {
         if (g_dashboard) return TRUE;
+        if (g_helpOpen) {
+            int n = (int)g_helpLines.size(), view = max(1, g_helpViewLines);
+            if (n > view) {
+                g_helpScroll = max(0, min(n - view, g_helpScroll + (zDelta > 0 ? -3 : 3)));
+                Invalidate(FALSE);
+            }
+            return TRUE;
+        }
         if (g_palette) {   // scroll the palette list
             int n = (int)g_palHits.size(), rows = min(n, kPalMaxRows);
             if (n > rows) {
@@ -8129,6 +8273,10 @@ public:
         if (noticeClick(pt)) { g_attentionLeftUp = true; SetCapture(); g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); return; }
         if (g_dashboard) { g_attentionLeftUp = true; SetCapture(); g_attentionDoubleUntil = GetTickCount64() + GetDoubleClickTime(); dashboardClick(pt); return; }
         if (inSplitter(pt.x, pt.y)) { g_splitDrag = true; SetCapture(); return; }   // grab the sidebar splitter
+        if (g_helpOpen) {
+            if (!PtInRect(&g_helpCard, POINT{ pt.x, pt.y })) { closeHelp(); SetFocus(); }
+            return;
+        }
         if (g_palette) {   // click an item to run it; click anywhere else to dismiss
             if (PtInRect(&g_palList, POINT{ pt.x, pt.y })) {
                 int i = g_palTop + (pt.y - g_palList.top) / (g_ch + 8);
@@ -8763,6 +8911,7 @@ public:
                 ::MessageBoxW(g_hwnd, widen(r).c_str(), L"agliteterm", MB_OK | MB_ICONINFORMATION);
                 break;
             }
+            case IDM_HELP: openHelp(); break;
             case IDM_ABOUT: {
                 std::wstring about = L"agliteterm " + updVersion() +
                                      L"\nA lightweight native terminal over the Rust pty-host.";
